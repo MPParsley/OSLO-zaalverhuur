@@ -1,0 +1,259 @@
+name: Fine-tune OSLO Zaalreservatie Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Basis model om te fine-tunen'
+        required: false
+        default: 'gpt-4o-mini-2024-07-18'
+        type: choice
+        options:
+          - gpt-4o-mini-2024-07-18
+          - gpt-4o-2024-08-06
+          - gpt-3.5-turbo-0125
+      suffix:
+        description: 'Model name suffix'
+        required: false
+        default: 'oslo-zaalreservatie'
+        type: string
+  push:
+    branches:
+      - main
+      - 'claude/**'
+    paths:
+      - 'training-data/**'
+      - 'scripts/fine_tune.py'
+      - '.github/workflows/fine-tune-model.yml'
+
+jobs:
+  validate-training-data:
+    name: Valideer Trainingsdata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Valideer JSON structuur
+        run: |
+          echo "🔍 Valideren van JSONL structuur..."
+          python -c "
+          import json
+          import sys
+
+          with open('training-data/examples.jsonl', 'r') as f:
+              lines = f.readlines()
+              print(f'📊 Aantal voorbeelden: {len(lines)}')
+
+              for idx, line in enumerate(lines, 1):
+                  try:
+                      data = json.loads(line)
+                      if 'messages' not in data:
+                          print(f'❌ Regel {idx}: messages key ontbreekt')
+                          sys.exit(1)
+                      print(f'✅ Regel {idx}: Valid')
+                  except json.JSONDecodeError as e:
+                      print(f'❌ Regel {idx}: JSON error - {e}')
+                      sys.exit(1)
+
+          print('✅ Alle regels zijn geldige JSON')
+          "
+
+      - name: Valideer SPARQL queries
+        run: |
+          echo "🔍 Valideren van SPARQL queries..."
+          python scripts/validate_queries.py
+
+      - name: Upload validatie rapport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-report
+          path: |
+            training-data/examples.jsonl
+          retention-days: 30
+
+  fine-tune:
+    name: Fine-tune Model
+    needs: validate-training-data
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+
+    outputs:
+      job_id: ${{ steps.fine-tune.outputs.job_id }}
+      model_name: ${{ steps.fine-tune.outputs.model_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run fine-tuning
+        id: fine-tune
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          echo "🚀 Starten van fine-tuning..."
+
+          MODEL="${{ github.event.inputs.model || 'gpt-4o-mini-2024-07-18' }}"
+          SUFFIX="${{ github.event.inputs.suffix || 'oslo-zaalreservatie' }}"
+
+          python scripts/fine_tune.py \
+            --training-file training-data/examples.jsonl \
+            --model "$MODEL" \
+            --suffix "$SUFFIX"
+
+          # Lees job ID
+          if [ -f fine_tune_job_id.txt ]; then
+            JOB_ID=$(cat fine_tune_job_id.txt)
+            echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+            echo "model_name=$SUFFIX" >> $GITHUB_OUTPUT
+            echo "✅ Job ID: $JOB_ID"
+          else
+            echo "❌ Job ID niet gevonden"
+            exit 1
+          fi
+
+      - name: Bewaar job informatie
+        run: |
+          cat > fine_tune_info.json <<EOF
+          {
+            "job_id": "${{ steps.fine-tune.outputs.job_id }}",
+            "model_name": "${{ steps.fine-tune.outputs.model_name }}",
+            "base_model": "${{ github.event.inputs.model || 'gpt-4o-mini-2024-07-18' }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "commit": "${{ github.sha }}",
+            "run_id": "${{ github.run_id }}"
+          }
+          EOF
+
+          echo "📝 Job informatie opgeslagen"
+          cat fine_tune_info.json
+
+      - name: Upload job informatie
+        uses: actions/upload-artifact@v4
+        with:
+          name: fine-tune-job-info
+          path: |
+            fine_tune_job_id.txt
+            fine_tune_info.json
+          retention-days: 90
+
+      - name: Maak GitHub Release (bij success)
+        if: success() && github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const jobInfo = JSON.parse(fs.readFileSync('fine_tune_info.json', 'utf8'));
+
+            const tagName = `model-${jobInfo.model_name}-${jobInfo.timestamp.split('T')[0]}`;
+            const releaseName = `Fine-tuned Model: ${jobInfo.model_name}`;
+
+            const body = `
+            ## OSLO Zaalreservatie Fine-tuned Model
+
+            **Job ID:** \`${jobInfo.job_id}\`
+            **Base Model:** \`${jobInfo.base_model}\`
+            **Model Name:** \`${jobInfo.model_name}\`
+            **Timestamp:** ${jobInfo.timestamp}
+            **Commit:** ${jobInfo.commit}
+
+            ### Status Check
+
+            Controleer de status van het fine-tuning proces:
+
+            \`\`\`bash
+            python scripts/fine_tune.py --check-status ${jobInfo.job_id}
+            \`\`\`
+
+            ### Training Data
+
+            Het model is getraind op de voorbeelden in \`training-data/examples.jsonl\`.
+
+            ### Gebruik
+
+            Zodra het fine-tuning proces voltooid is, gebruik je het model via de OpenAI API:
+
+            \`\`\`python
+            from openai import OpenAI
+
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model="<fine-tuned-model-name>",
+                messages=[
+                    {"role": "system", "content": "Je bent een SPARQL-query generator voor het OSLO Zaalreservatie vocabularium."},
+                    {"role": "user", "content": "Welke zalen zijn beschikbaar vrijdagavond?"}
+                ]
+            )
+            \`\`\`
+            `;
+
+            try {
+              await github.rest.repos.createRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag_name: tagName,
+                name: releaseName,
+                body: body,
+                draft: false,
+                prerelease: false
+              });
+
+              console.log(`✅ Release aangemaakt: ${tagName}`);
+            } catch (error) {
+              console.log(`⚠️  Release kon niet aangemaakt worden: ${error.message}`);
+            }
+
+  notify:
+    name: Notificatie
+    needs: fine-tune
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download job info
+        uses: actions/download-artifact@v4
+        with:
+          name: fine-tune-job-info
+
+      - name: Toon resultaat
+        run: |
+          echo "========================================="
+          echo "  OSLO Zaalreservatie Fine-tuning"
+          echo "========================================="
+          echo ""
+
+          if [ -f fine_tune_info.json ]; then
+            echo "✅ Fine-tuning job succesvol gestart!"
+            echo ""
+            cat fine_tune_info.json | python -m json.tool
+            echo ""
+            echo "📊 Controleer de status via:"
+            echo "   python scripts/fine_tune.py --check-status $(cat fine_tune_job_id.txt)"
+          else
+            echo "❌ Fine-tuning job gefaald"
+          fi
+
+          echo ""
+          echo "========================================="
