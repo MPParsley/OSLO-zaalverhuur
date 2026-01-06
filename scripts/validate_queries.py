@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 from rdflib.plugins.sparql import prepareQuery
-from rdflib.plugins.sparql.parser import ParseException
 
 
 REQUIRED_NAMESPACE = "https://data.vlaanderen.be/ns/zaalreservatie#"
@@ -67,10 +66,8 @@ def validate_query(query: str) -> Tuple[bool, str]:
     try:
         prepareQuery(query)
         return True, ""
-    except ParseException as e:
-        return False, f"SPARQL syntax error: {e}"
     except Exception as e:
-        return False, f"Validatie error: {e}"
+        return False, f"SPARQL syntax error: {e}"
 
 
 def main():
